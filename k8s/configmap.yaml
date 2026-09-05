@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-platform-config
+  labels:
+    app: ai-platform-api
+data:
+  APP_NAME: "AI-Platform-QA-API"
+  APP_ENV: "production"
+  PORT: "8000"
+  HOST: "0.0.0.0"
+  DB_POOL_SIZE: "25"
+  DB_MAX_OVERFLOW: "15"
+  REDIS_URL: "redis://redis-service.default.svc.cluster.local:6379/0"
+  REDIS_CACHE_TTL_SECONDS: "3600"
+  RATE_LIMIT_REQUESTS_PER_MINUTE: "60"
+  LLM_PROVIDER: "mock"
+  PRIMARY_MODEL: "gpt-4o-mini"
+  FALLBACK_MODEL: "gpt-3.5-turbo"
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: "5"
+  CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECONDS: "30.0"
+  MAX_RETRIES: "3"
+  BASE_BACKOFF_SECONDS: "0.5"
+  MAX_BACKOFF_SECONDS: "4.0"

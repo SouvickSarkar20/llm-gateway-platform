@@ -1,0 +1,13 @@
+# Prometheus configuration for AI Platform API monitoring
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "ai_platform_api"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["web:8000"]
+        labels:
+          environment: "production"
+          service: "ai-platform-gateway"

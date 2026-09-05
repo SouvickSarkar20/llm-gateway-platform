@@ -1,0 +1,115 @@
+version: "3.8"
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. FastAPI Platform Service
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_platform_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=AI-Platform-QA-API
+      - APP_ENV=production
+      - DEBUG=false
+      - PORT=8000
+      - HOST=0.0.0.0
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-e2b69476b7b15d2a71f00889cfd38a0f9b6e8f498cbf1277a19ffdc64bb93b2a}
+      - JWT_ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=60
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/chat_platform
+      - DB_POOL_SIZE=20
+      - DB_MAX_OVERFLOW=10
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_CACHE_TTL_SECONDS=3600
+      - RATE_LIMIT_REQUESTS_PER_MINUTE=60
+      - LLM_PROVIDER=${LLM_PROVIDER:-mock}
+      - PRIMARY_MODEL=${PRIMARY_MODEL:-gpt-4o-mini}
+      - FALLBACK_MODEL=${FALLBACK_MODEL:-gpt-3.5-turbo}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - CIRCUIT_BREAKER_FAILURE_THRESHOLD=5
+      - CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECONDS=30.0
+      - MAX_RETRIES=3
+      - BASE_BACKOFF_SECONDS=0.5
+      - MAX_BACKOFF_SECONDS=4.0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - platform_net
+
+  # ---------------------------------------------------------------------------
+  # 2. PostgreSQL Relational Database (Persistent Data & Audit Logs)
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: ai_platform_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-chat_platform}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chat_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - platform_net
+
+  # ---------------------------------------------------------------------------
+  # 3. Redis In-Memory Cache & Distributed Rate Limiter
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ai_platform_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - platform_net
+
+  # ---------------------------------------------------------------------------
+  # 4. Prometheus Monitoring & Metric Scraper
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: ai_platform_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - web
+    networks:
+      - platform_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+
+networks:
+  platform_net:
+    driver: bridge
