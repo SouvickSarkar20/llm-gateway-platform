@@ -60,20 +60,26 @@ sequenceDiagram
 
 Let us calculate the required compute footprint at **500 RPS** with realistic LLM latency:
 
-- **Target Throughput ($R$):** $500\text{ req/sec}$
-- **Cache Hit Ratio ($C$):** $35\%$ (served from Redis in $<5\text{ms}$)
-- **Uncached Requests ($R_{\text{llm}}$):** $500 \times (1 - 0.35) = 325\text{ req/sec}$
-- **Upstream LLM p95 Latency ($L$):** $2.0\text{ seconds}$
-- **Little’s Law ($N = R \times L$):**
-  $$N_{\text{in-flight}} = 325\text{ req/sec} \times 2.0\text{s} = 650\text{ concurrent in-flight connections}$$
+- **Target Throughput (R):** 500 req/sec
+- **Cache Hit Ratio (C):** 35% (served from Redis in < 5ms)
+- **Uncached Requests (R_llm):** `500 * (1 - 0.35) = 325 req/sec`
+- **Upstream LLM p95 Latency (L):** 2.0 seconds
+- **Little's Law (N = R * L):**
+  ```text
+  N_in_flight = 325 req/sec * 2.0s = 650 concurrent in-flight connections
+  ```
 
 #### Worker & Pod Calculation:
-- An asynchronous FastAPI worker running on Uvicorn with `uvloop` can safely maintain **$50$ concurrent non-blocking I/O connections** without event-loop saturation or memory degradation.
-- Concurrent workers required: $650 / 50 = 13\text{ workers}$.
-- Running **2 workers per pod** on **0.5 vCPU / 512MiB RAM**:
-  $$\text{Pods Required} = \left\lceil \frac{13}{2} \right\rceil = 7\text{ pods (baseline)}$$
-- Applying an enterprise **$N+2$ redundancy factor** and headroom for CPU spikes ($60\%$ target CPU):
-  $$\text{Recommended Autoscaling Scale Target} = 12 \text{ to } 20\text{ pods}.$$
+- An asynchronous FastAPI worker running on Uvicorn with `uvloop` can safely maintain **50 concurrent non-blocking I/O connections** without event-loop saturation or memory degradation.
+- **Concurrent workers required:** `650 / 50 = 13 workers`
+- **Running 2 workers per pod on 0.5 vCPU / 512MiB RAM:**
+  ```text
+  Pods Required (Baseline) = ceil(13 / 2) = 7 pods
+  ```
+- **Applying an enterprise N+2 redundancy factor and headroom for CPU spikes (60% target CPU):**
+  ```text
+  Recommended Autoscaling Scale Target = 12 to 20 pods
+  ```
 
 ```mermaid
 graph TD
@@ -97,8 +103,8 @@ graph TD
 
     subgraph Resilient Gateway & External Providers
         Pod1 & Pod2 & PodN --> GW[Resilient LLM Gateway]
-        GW -->|Primary: gpt-4o-mini| OpenAI[OpenAI API]
-        GW -.->|Circuit Breaker OPEN| Fallback[Fallback: Gemini / gpt-3.5]
+        GW -->|Primary: gemini-3.6-flash| Gemini[Google Gemini API]
+        GW -.->|Circuit Breaker OPEN| Fallback[Fallback: gemini-3.5-flash]
     end
 ```
 
@@ -109,8 +115,8 @@ graph TD
    - Separate Kubernetes probes: `startupProbe` (5s), `readinessProbe` (fails out of load balancer within 10s of Redis disruption), and `livenessProbe` (restarts deadlock pods).
 
 2. **Kubernetes HPA Configuration:**
-   - Scales on dual metrics: CPU utilization ($60\%$) and custom metrics via Prometheus Adapter (`rate(http_requests_total[1m])`).
-   - Scale-up policy is aggressive ($100\%$ pod expansion every 15s) to catch traffic surges; scale-down stabilization window is set to $300\text{s}$ (5 minutes) to avoid thrashing.
+   - Scales on dual metrics: CPU utilization (60%) and custom metrics via Prometheus Adapter (`rate(http_requests_total[1m])`).
+   - Scale-up policy is aggressive (100% pod expansion every 15s) to catch traffic surges; scale-down stabilization window is set to 300s (5 minutes) to avoid thrashing.
 
 3. **Redis Cluster (Caching & Distributed Rate Limiting):**
    - Redis operates in a 3-node master + 3-node read-replica cluster with Redis Sentinel.
@@ -118,7 +124,7 @@ graph TD
    - Redis failure fallback: **fail-open** ensures the platform remains available even if the cache crashes.
 
 4. **Handling LLM Provider Quotas (RPM, TPM & Concurrency Limits):**
-   - External providers enforce strict rate limits (e.g., Tier 4 OpenAI: $10,000\text{ RPM}$, $1,000,000\text{ TPM}$).
+   - External providers enforce strict rate limits (e.g., Tier 4 limits: 10,000 RPM, 1,000,000 TPM).
    - Client-side token bucket in Redis throttles requests before they leave our network.
    - Batching & Asynchronous Offloading: Non-interactive queries (summaries, indexing) are pushed to an asynchronous Celery/ARQ queue backed by Redis, preserving synchronous capacity for interactive conversational requests.
 
@@ -145,7 +151,7 @@ flowchart LR
         EKS --> ElastiCache[(Amazon ElastiCache Redis 7 Multi-AZ)]
         EKS --> Aurora[(Amazon Aurora PostgreSQL Serverless v2)]
         EKS --> LLMGW[LLM Gateway with Circuit Breaker]
-        LLMGW --> ExtLLM[OpenAI / Gemini / Anthropic]
+        LLMGW --> ExtLLM[Gemini / OpenAI / Anthropic]
     end
 ```
 
@@ -177,7 +183,7 @@ graph TD
 
 ### Phase 2: Data Migration & Synchronization
 - Execute initial PostgreSQL dump and restore to Aurora.
-- Deploy **AWS Database Migration Service (DMS)** with Change Data Capture (CDC) to continuously replicate changes from legacy EC2 to Aurora in real-time until replication lag reaches $<100\text{ms}$.
+- Deploy **AWS Database Migration Service (DMS)** with Change Data Capture (CDC) to continuously replicate changes from legacy EC2 to Aurora in real-time until replication lag reaches < 100ms.
 
 ### Phase 3: Canary Traffic Routing (Route 53 Weighted Records)
 - **Day 1:** 90% legacy EC2, 10% EKS cluster. Monitor Prometheus error rates, latency, and DB connections.
@@ -193,7 +199,7 @@ graph TD
 
 | Failure Scenario | Immediate Detection | System Response | End-User Impact |
 | :--- | :--- | :--- | :--- |
-| **Primary LLM Provider Outage (503 / 504)** | Consecutive failures detected by Circuit Breaker | 1. Backoff retry (3 attempts with jitter)<br/>2. Failover to secondary model (`gpt-3.5-turbo`)<br/>3. Trip Circuit Breaker to `OPEN` | Minor change in output style; 0 downtime; 0 dropped requests. |
+| **Primary LLM Provider Outage (503 / 504)** | Consecutive failures detected by Circuit Breaker | 1. Backoff retry (3 attempts with jitter)<br/>2. Failover to secondary model (`gemini-3.5-flash`)<br/>3. Trip Circuit Breaker to `OPEN` | Minor change in output style; 0 downtime; 0 dropped requests. |
 | **Provider Rate Limit (HTTP 429)** | Status code 429 classified as retryable | Exponential backoff with randomized jitter; Redis rate limiter tightens outbound admission | Latency increases by 200–500ms; requests succeed without errors. |
-| **Redis Cluster Disruption** | Redis connection timeout ($2\text{s}$) | Platform **fails open**: skips cache, defaults to stateless rate limit, issues warning log | Cache misses increase LLM calls; platform remains 100% operational. |
+| **Redis Cluster Disruption** | Redis connection timeout (2s) | Platform **fails open**: skips cache, defaults to stateless rate limit, issues warning log | Cache misses increase LLM calls; platform remains 100% operational. |
 | **Database Pool Exhaustion** | SQLAlchemy async pool timeout | Backpressure applied; health check flips to 503; ALB diverts traffic away from degraded pod | Upstream requests routed to healthy pods; zero cascading crash. |
