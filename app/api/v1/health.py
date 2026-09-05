@@ -53,6 +53,7 @@ async def health_check(
         "status": "healthy" if all_healthy else "unhealthy",
         "database": "connected" if db_ok else "disconnected",
         "redis": "connected" if redis_ok else "disconnected",
+        # pyrefly: ignore [deprecated]
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "version": "1.0.0",
         "issues": details if not all_healthy else [],

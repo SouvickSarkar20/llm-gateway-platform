@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     FALLBACK_MODEL: str = "gpt-3.5-turbo"
     OPENAI_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
-    LLM_REQUEST_TIMEOUT_SECONDS: float = 10.0
+    LLM_REQUEST_TIMEOUT_SECONDS: float = 35.0
 
     # Circuit Breaker & Retry Settings
     CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = 5

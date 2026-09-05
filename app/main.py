@@ -103,17 +103,10 @@ Instrumentator(
 ).instrument(app)
 
 
-# Mount routers: both under /api/v1 and root aliases to guarantee exact assessment spec match
-app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
+# Mount routers directly per assessment specification
 app.include_router(auth_router)
-
-app.include_router(chat_router, prefix=settings.API_V1_PREFIX)
 app.include_router(chat_router)
-
-app.include_router(health_router, prefix=settings.API_V1_PREFIX)
 app.include_router(health_router)
-
-app.include_router(metrics_router, prefix=settings.API_V1_PREFIX)
 app.include_router(metrics_router)
 
 

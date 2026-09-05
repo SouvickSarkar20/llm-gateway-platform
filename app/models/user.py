@@ -35,9 +35,11 @@ class User(Base):
     )
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        # pyrefly: ignore [deprecated]
         DateTime, default=datetime.utcnow, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        # pyrefly: ignore [deprecated]
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
 

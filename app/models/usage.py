@@ -65,6 +65,7 @@ class LLMUsageLog(Base):
         Text, nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
+        # pyrefly: ignore [deprecated]
         DateTime, default=datetime.utcnow, index=True, nullable=False
     )
 

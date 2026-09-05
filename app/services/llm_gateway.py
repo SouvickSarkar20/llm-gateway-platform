@@ -410,7 +410,8 @@ class GeminiLLMProvider(BaseLLMProvider):
         }
 
         start_time = time.perf_counter()
-        async with httpx.AsyncClient(timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS) as client:
+        timeout = httpx.Timeout(settings.LLM_REQUEST_TIMEOUT_SECONDS, connect=10.0, read=settings.LLM_REQUEST_TIMEOUT_SECONDS)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             try:
                 res = await client.post(url, json=payload)
                 res.raise_for_status()
