@@ -380,6 +380,75 @@ class OpenAILLMProvider(BaseLLMProvider):
         )
 
 
+class GeminiLLMProvider(BaseLLMProvider):
+    """Google Gemini API Provider using async HTTP client."""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or settings.GEMINI_API_KEY
+        self.base_url = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    async def call(self, request: LLMRequest) -> LLMResponse:
+        key = self.api_key or settings.GEMINI_API_KEY
+        if not key:
+            raise LLMClientException("GEMINI_API_KEY is not configured", status_code=500)
+
+        # Normalize model name
+        model_name = request.model if "gemini" in request.model.lower() else "gemini-1.5-flash"
+        url = f"{self.base_url}/{model_name}:generateContent?key={key}"
+
+        contents = []
+        for m in request.messages:
+            role = "user" if m.role in ("user", "system") else "model"
+            contents.append({"role": role, "parts": [{"text": m.content}]})
+
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": request.temperature,
+                "maxOutputTokens": request.max_tokens,
+            },
+        }
+
+        start_time = time.perf_counter()
+        async with httpx.AsyncClient(timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS) as client:
+            try:
+                res = await client.post(url, json=payload)
+                res.raise_for_status()
+                data = res.json()
+            except httpx.TimeoutException as exc:
+                raise LLMTimeoutException(f"Gemini request timed out: {exc}") from exc
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                if code == 429:
+                    raise LLMRateLimitException(f"Gemini rate limit: {exc.response.text}") from exc
+                elif code >= 500:
+                    raise LLMServerException(f"Gemini server error: {code}", status_code=code) from exc
+                else:
+                    raise LLMClientException(f"Gemini client error: {exc.response.text}", status_code=code) from exc
+
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        try:
+            content = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError) as exc:
+            raise LLMServerException(f"Malformed response from Gemini: {data}") from exc
+
+        usage = data.get("usageMetadata", {})
+        prompt_tokens = usage.get("promptTokenCount", 0)
+        completion_tokens = usage.get("candidatesTokenCount", 0)
+        total_tokens = usage.get("totalTokenCount", prompt_tokens + completion_tokens)
+
+        return LLMResponse(
+            content=content,
+            model_used=model_name,
+            provider="gemini",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            latency_ms=round(latency_ms, 2),
+            is_fallback=False,
+        )
+
+
 # ==========================================
 # 5. Resilient LLM Gateway (Orchestrator)
 # ==========================================
@@ -404,6 +473,7 @@ class ResilientLLMGateway:
         self._providers: Dict[str, BaseLLMProvider] = {
             "mock": MockLLMProvider(),
             "openai": OpenAILLMProvider(),
+            "gemini": GeminiLLMProvider(),
         }
 
     def get_provider(self, name: str) -> BaseLLMProvider:

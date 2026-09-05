@@ -54,6 +54,7 @@ async def chat(
             detail="Either 'question' or 'messages' must be provided.",
         )
 
+    question_text: str
     if payload.question and not payload.messages:
         question_text = payload.question
         messages = [LLMMessage(role="user", content=question_text)]
@@ -61,13 +62,13 @@ async def chat(
         messages = [LLMMessage(role=m.role, content=m.content) for m in payload.messages]
         question_text = payload.messages[-1].content
     else:
-        question_text = payload.question
-        messages = [LLMMessage(role=m.role, content=m.content) for m in payload.messages]
+        question_text = payload.question or (payload.messages[-1].content if payload.messages else "")
+        messages = [LLMMessage(role=m.role, content=m.content) for m in (payload.messages or [])]
 
     target_model = payload.model or settings.PRIMARY_MODEL
 
     # Attach rate limit headers if available
-    rate_limit_result: RateLimitResult = getattr(request.state, "rate_limit_result", None)
+    rate_limit_result: RateLimitResult | None = getattr(request.state, "rate_limit_result", None)
     if rate_limit_result:
         response.headers["X-RateLimit-Limit"] = str(rate_limit_result.limit)
         response.headers["X-RateLimit-Remaining"] = str(rate_limit_result.remaining)
