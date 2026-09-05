@@ -393,7 +393,7 @@ class GeminiLLMProvider(BaseLLMProvider):
             raise LLMClientException("GEMINI_API_KEY is not configured", status_code=500)
 
         # Normalize model name
-        model_name = request.model if "gemini" in request.model.lower() else "gemini-1.5-flash"
+        model_name = request.model if "gemini" in request.model.lower() else "gemini-3.6-flash"
         url = f"{self.base_url}/{model_name}:generateContent?key={key}"
 
         contents = []
