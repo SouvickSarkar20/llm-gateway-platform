@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     API_V1_PREFIX: str = "/api/v1"
 
     # Security & JWT Authentication
-    JWT_SECRET_KEY: str = "e2b69476b7b15d2a71f00889cfd38a0f9b6e8f498cbf1277a19ffdc64bb93b2a"
+    JWT_SECRET_KEY: str = "dev_jwt_secret_key_change_in_production_32chars"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
