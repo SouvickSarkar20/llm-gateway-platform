@@ -1,276 +1,168 @@
-# Resilient AI Question-Answering Platform & LLM Gateway
+# AI LLM Gateway Platform
 
-[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
-[![Redis](https://img.shields.io/badge/Redis-7-DC382D?style=flat&logo=redis&logoColor=white)](https://redis.io/)
-[![Prometheus](https://img.shields.io/badge/Prometheus-Compatible-E6522C?style=flat&logo=prometheus&logoColor=white)](https://prometheus.io/)
-[![Docker](https://img.shields.io/badge/Docker-Multi--Stage-2496ED?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
-[![Tests](https://img.shields.io/badge/Pytest-23%20Passed%20(100%25)-44CC11?style=flat&logo=pytest&logoColor=white)](https://docs.pytest.org/)
-
-A production-grade, enterprise-ready AI Question-Answering API and resilient LLM Gateway built with Python, FastAPI, PostgreSQL, Redis, and Docker. Designed specifically for high-availability production workloads, cost governance, and automated scaling.
+A production-ready AI Question-Answering API built with FastAPI, Redis, PostgreSQL, and a resilient LLM Gateway. Implements JWT authentication, role-based access control, distributed rate limiting, circuit breaking, and Prometheus observability.
 
 ---
 
-## 🏗️ Architecture Overview
+## Table of Contents
 
-```mermaid
-graph TD
-    subgraph Client Layer
-        Client[Users / Client Apps]
-    end
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [API Reference](#api-reference)
+- [Authentication and RBAC](#authentication-and-rbac)
+- [LLM Gateway Resilience](#llm-gateway-resilience)
+- [Prerequisites](#prerequisites)
+- [Configuration](#configuration)
+- [Running Locally](#running-locally)
+- [Running with Docker Compose](#running-with-docker-compose)
+- [Kubernetes Deployment](#kubernetes-deployment)
+- [Running Tests](#running-tests)
+- [Monitoring](#monitoring)
+- [Default Credentials](#default-credentials)
+- [Project Structure](#project-structure)
+- [Scaling and Architecture Decisions](#scaling-and-architecture-decisions)
 
-    subgraph Edge & Ingress
-        LB[Load Balancer / Reverse Proxy]
-    end
+---
 
-    subgraph Application Tier [FastAPI Cluster / Kubernetes Pods]
-        Auth[JWT & RBAC Guard<br/>Admin / User / ReadOnly]
-        RateLimit[Sliding-Window Rate Limiter<br/>60 req/min per User / IP]
-        CacheCheck{Redis Cache Check}
-        AuditLogger[Async DB Audit Logger]
-        MetricsExporter[Prometheus Metrics Exporter<br/>/metrics]
+## Overview
 
-        subgraph Gateway [Resilient LLM Gateway]
-            CB[3-State Circuit Breaker<br/>CLOSED ↔ HALF_OPEN ↔ OPEN]
-            Retry[Exponential Backoff + Full Jitter<br/>Up to 3 Retries on 429/5xx]
-            Classifier[Error Classifier<br/>Retryable vs Non-Retryable]
-            FallbackRouter[Multi-Model Fallback Router]
-        end
-    end
+This platform accepts a user question via HTTP, authenticates the request using a JWT bearer token, routes the query through a resilient LLM Gateway (supporting OpenAI, Google Gemini, or a deterministic mock provider), persists token usage and cost to PostgreSQL, caches responses in Redis, and exposes Prometheus metrics for observability.
 
-    subgraph State & Persistence
-        RedisCache[(Redis 7<br/>Response Cache & Rate Limit ZSET)]
-        PostgresDB[(PostgreSQL 16<br/>Users & Persistent Usage Logs)]
-    end
+Core Capabilities:
 
-    subgraph Upstream LLM Providers
-        OpenAI[Primary LLM: OpenAI / Gemini]
-        BackupLLM[Fallback LLM: GPT-3.5 / Secondary]
-    end
+- JWT authentication with RBAC (Admin, User, Read-Only roles)
+- POST /chat with caching, retry logic, and fallback model support
+- Circuit breaker (3-state: CLOSED, HALF_OPEN, OPEN) per provider
+- Exponential backoff with full jitter on retryable errors
+- Distributed sliding-window rate limiting via Redis sorted sets
+- Per-request token usage and cost tracking persisted to PostgreSQL
+- Prometheus metrics: LLM latency, token counts, cache hit/miss, circuit breaker state
+- Multi-stage Docker build with a non-root runtime user
+- Kubernetes manifests with HPA scaling from 3 to 30 replicas
+- 5 test suites covering database, auth, LLM gateway, Redis, and the chat API
 
-    Client -->|Bearer Token + Question| LB
-    LB --> Auth
-    Auth --> RateLimit
-    RateLimit -->|Atomic Pipeline| RedisCache
-    RateLimit --> CacheCheck
-    CacheCheck -->|Cache HIT <5ms| AuditLogger
-    CacheCheck -->|Cache MISS| CB
-    CB --> Retry
-    Retry --> Classifier
-    Classifier -->|Primary Provider| OpenAI
-    Classifier -.->|Primary Failed / Circuit OPEN| FallbackRouter
-    FallbackRouter --> BackupLLM
-    OpenAI & BackupLLM --> CacheCheck
-    CacheCheck -->|Populate Cache| RedisCache
-    OpenAI & BackupLLM --> AuditLogger
-    AuditLogger -->|Persist Tokens, Cost, Latency| PostgresDB
-    ApplicationTier -.->|Scrapes Histograms, Counters| MetricsExporter
+---
+
+## Architecture
+
+```
+Client
+  |
+  v
+FastAPI Application (Uvicorn + asyncio)
+  |-- POST /auth/login     -> JWT issuance
+  |-- POST /chat           -> Rate limiter -> Redis cache -> LLM Gateway -> PostgreSQL
+  |-- GET  /health         -> PostgreSQL + Redis liveness probes
+  |-- GET  /metrics        -> Prometheus scrape endpoint
+  |
+  |-- Redis 7              (sliding-window rate limiter, response cache, TTL: 1h)
+  |-- PostgreSQL 16        (users table, llm_usage_logs table)
+  |-- LLM Gateway
+        |-- Primary model  (OpenAI gpt-4o-mini or Gemini 1.5 Flash)
+        |-- Fallback model (OpenAI gpt-3.5-turbo or Gemini 1.5 Flash)
+        |-- Circuit Breaker per provider
+        |-- Exponential backoff + jitter (up to 3 retries)
 ```
 
----
-
-## 💎 What Distinguishes This Submission (Top 5% Implementation)
-
-### 1. Resilient LLM Gateway (`/chat`)
-- **Exponential Backoff with Full Jitter:** Prevents the thundering herd problem against upstream providers:
-  $$\text{Sleep} = \min(\text{MaxBackoff}, \text{BaseBackoff} \times 2^{\text{attempt}}) + \text{Uniform}(0, \text{Jitter})$$
-- **3-State Circuit Breaker (`CLOSED`, `OPEN`, `HALF-OPEN`):** If upstream failures hit the threshold (5 consecutive errors), the circuit trips to `OPEN`. Subsequent requests **fast-fail immediately without network calls**, protecting worker threads. After a 30s recovery window, it transitions to `HALF-OPEN` to safely probe recovery.
-- **Active Model Fallback:** When the primary model (`gpt-4o-mini`) exhausts retries or trips the circuit, traffic is seamlessly routed to the fallback model (`gpt-3.5-turbo`), returning `X-Fallback-Triggered: true` with 0 downtime.
-- **Strict Error Classification:** Differentiates retryable errors (HTTP 429, 500, 502, 503, 504, timeouts) from non-retryable client errors (HTTP 400 bad prompt, 401, 403, 422).
-
-### 2. Dual-Purpose Redis Engine
-- **Response Cache-Aside:** SHA-256 fingerprint of `(model, prompt, system_prompt)` returning identical queries in **$<5\text{ms}$** with `X-Cache: HIT`, consuming 0 LLM tokens and $0.00 cost.
-- **Distributed Sliding-Window Rate Limiter:** Implemented via atomic Redis Sorted Sets (`ZADD`, `ZREMRANGEBYSCORE`, `ZCARD`) returning standard RFC headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) and HTTP 429.
-
-### 3. Persistent Token Usage & Cost Governance
-- Every request audits directly into PostgreSQL table `llm_usage_logs`:
-  - `request_id`, `user_id`, `model`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `latency_ms`, `cache_hit`, and computed `estimated_cost_usd`.
-
-### 4. True Prometheus `/metrics` Endpoint
-- Not a static JSON dictionary. Native Prometheus scrape format using `prometheus-client` and `prometheus-fastapi-instrumentator`:
-  - `llm_requests_total{model, provider, status}`
-  - `llm_tokens_total{model, token_type="prompt|completion"}`
-  - `llm_request_duration_seconds{model, provider}` (p50/p90/p99 latency histograms)
-  - `llm_circuit_breaker_state{provider}` (Gauge: 0=CLOSED, 1=HALF_OPEN, 2=OPEN)
-  - `llm_cache_hits_total` and `llm_cache_misses_total`
-  - `llm_rate_limit_exceeded_total{identifier_type}`
-
-### 5. Production DevOps & Scaling (Sections 2, 4, 5)
-- Multi-stage, non-root `Dockerfile` (UID 10001).
-- `docker-compose.yml` orchestrating API, PostgreSQL 16, Redis 7, and Prometheus.
-- Kubernetes manifests (`Deployment`, `Service`, `HPA`, `ConfigMap`, `Secret`) with 100 $\rightarrow$ 500 RPS mathematical capacity proofs in [ARCHITECTURE.md](file:///d:/chat-assignment/ARCHITECTURE.md).
-- Complete 5-minute video presentation script in [LOOM_SCRIPT.md](file:///d:/chat-assignment/LOOM_SCRIPT.md).
+For detailed architecture diagrams, scaling analysis, SSO/OIDC integration plan, migration roadmap, and failure mode analysis, see ARCHITECTURE.md.
 
 ---
 
-## 🚀 Quick Start Guide
+## API Reference
 
-### Option A: Run with Docker Compose (Recommended)
+All endpoints are mounted at the root path without a version prefix to match the assessment specification.
 
-```bash
-# 1. Clone the repository and enter directory
-git clone https://github.com/SouvickSarkar20/llm-gateway-platform.git
-cd llm-gateway-platform
+### POST /auth/login
 
-# 2. Start the full stack (API, PostgreSQL, Redis, Prometheus)
-docker compose up --build -d
+Authenticate and receive a JWT bearer token.
 
-# 3. View running services
-docker compose ps
-```
-- API Docs: `http://localhost:8000/docs`
-- Health Endpoint: `http://localhost:8000/health`
-- Prometheus Scrape: `http://localhost:8000/metrics`
-- Prometheus UI: `http://localhost:9090`
-
----
-
-### Option B: Run Locally (Standalone Development)
-
-The application automatically creates database tables, seeds default users, and falls back to in-memory `FakeRedis` if live Redis is not running locally.
-
-```bash
-# 1. Create and activate virtual environment
-python -m venv .venv
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Initialize database and seed default RBAC users
-python scripts/init_db.py
-
-# 4. Start the FastAPI server
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
----
-
-## 👥 Default Seeded Credentials (RBAC)
-
-The database automatically seeds three accounts upon first startup:
-
-| Username | Password | Role | Permissions |
-| :--- | :--- | :--- | :--- |
-| `admin` | `admin123` | `admin` | Full system access, configuration, metrics, and chat |
-| `user` | `user123` | `user` | Standard chat access (`/chat`), rate limited |
-| `readonly` | `readonly123` | `readonly` | Read-only analytics; forbidden from `/chat` (403) |
-
----
-
-## 📡 API Reference & Curl Examples
-
-### 1. Authenticate & Obtain JWT
-```bash
-curl -X POST http://localhost:8000/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username": "user", "password": "user123"}'
-```
-**Response (200 OK):**
+Request body:
 ```json
 {
-  "access_token": "eyJhbGciOiJIUzI1NiIsIn...",
+  "username": "admin",
+  "password": "admin123"
+}
+```
+
+Response:
+```json
+{
+  "access_token": "<jwt>",
   "token_type": "bearer",
   "expires_in": 3600,
-  "user_id": "a90bb679-bca1-4fa3-94c0-2f3b9e4a3bcf",
-  "username": "user",
-  "role": "user"
+  "user_id": "<uuid>",
+  "username": "admin",
+  "role": "admin"
 }
 ```
 
 ---
 
-### 2. Submit Question to `/chat` (Cache Miss $\rightarrow$ Fresh Generation)
-```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Authorization: Bearer <YOUR_ACCESS_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "What is the difference between TCP and UDP?",
-    "use_cache": true
-  }' -i
+### POST /chat
+
+Submit a question to the LLM Gateway. Requires a valid bearer token for a User or Admin role.
+
+Headers:
 ```
-**Response Headers:**
-```http
-HTTP/1.1 200 OK
-X-Cache: MISS
-X-Model-Used: gpt-4o-mini
-X-RateLimit-Limit: 60
-X-RateLimit-Remaining: 59
-X-RateLimit-Reset: 60
-X-Process-Time-Ms: 68.42
+Authorization: Bearer <access_token>
 ```
-**Response Body:**
+
+Request body:
 ```json
 {
-  "answer": "[AI Response from gpt-4o-mini]: Regarding your query 'What is the difference between TCP and UDP?'...",
+  "question": "What is a circuit breaker pattern?",
+  "model": "gpt-4o-mini",
+  "temperature": 0.7,
+  "max_tokens": 1024,
+  "use_cache": true
+}
+```
+
+Alternatively, pass a structured `messages` array (OpenAI chat format) instead of `question`.
+
+Response:
+```json
+{
+  "answer": "A circuit breaker is ...",
   "model_used": "gpt-4o-mini",
-  "provider": "mock",
+  "provider": "openai",
   "is_fallback": false,
   "cache_hit": false,
   "usage": {
-    "prompt_tokens": 11,
-    "completion_tokens": 32,
-    "total_tokens": 43,
-    "estimated_cost_usd": 0.0000208,
-    "latency_ms": 65.12
+    "prompt_tokens": 42,
+    "completion_tokens": 185,
+    "total_tokens": 227,
+    "estimated_cost_usd": 0.0001234,
+    "latency_ms": 1247.5
   },
-  "request_id": "b1b86d63-b844-486a-aa70-9831d102e35f"
+  "request_id": "<uuid>"
 }
 ```
 
----
+Response headers:
 
-### 3. Submit Identical Question (Cache Hit $\rightarrow$ Sub-5ms Return)
-```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Authorization: Bearer <YOUR_ACCESS_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "What is the difference between TCP and UDP?",
-    "use_cache": true
-  }' -i
-```
-**Response Headers:**
-```http
-HTTP/1.1 200 OK
-X-Cache: HIT
-X-Model-Used: gpt-4o-mini
-X-Process-Time-Ms: 3.12
-```
-**Response Body (0 Tokens, $0.00 Cost):**
-```json
-{
-  "answer": "[AI Response from gpt-4o-mini]: Regarding your query 'What is the difference between TCP and UDP?'...",
-  "model_used": "gpt-4o-mini",
-  "provider": "mock",
-  "is_fallback": false,
-  "cache_hit": true,
-  "usage": {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0,
-    "estimated_cost_usd": 0.0,
-    "latency_ms": 2.85
-  },
-  "request_id": "893c72ef-4bf7-4e92-ba92-f045ceef9150"
-}
-```
+| Header | Description |
+|---|---|
+| `X-Cache` | `HIT` or `MISS` |
+| `X-Model-Used` | Model that produced the response |
+| `X-Fallback-Triggered` | Present and `true` when the fallback model was used |
+| `X-RateLimit-Limit` | Configured request quota per window |
+| `X-RateLimit-Remaining` | Requests remaining in the current window |
+| `X-RateLimit-Reset` | Seconds until the window resets |
+| `Retry-After` | Present on 503 when the circuit breaker is OPEN |
 
 ---
 
-### 4. Deep Health Check (`/health`)
-```bash
-curl -X GET http://localhost:8000/health
-```
-**Response (200 OK):**
+### GET /health
+
+Deep dependency health check. Returns 200 when both PostgreSQL and Redis are reachable; 503 otherwise.
+
 ```json
 {
   "status": "healthy",
   "database": "connected",
   "redis": "connected",
-  "timestamp": "2026-09-05T10:15:00.123456Z",
+  "timestamp": "2024-01-01T00:00:00Z",
   "version": "1.0.0",
   "issues": []
 }
@@ -278,51 +170,353 @@ curl -X GET http://localhost:8000/health
 
 ---
 
-### 5. Prometheus Scrape (`/metrics`)
+### GET /metrics
+
+Prometheus-format scrape endpoint. Returns standard `text/plain` Prometheus exposition format.
+
+Custom metrics exposed:
+
+| Metric | Type | Description |
+|---|---|---|
+| `llm_gateway_requests_total` | Counter | Total LLM requests by model, provider, status |
+| `llm_tokens_total` | Counter | Prompt and completion tokens consumed |
+| `llm_request_duration_seconds` | Histogram | LLM API call latency |
+| `llm_circuit_breaker_state` | Gauge | Circuit state: 0=CLOSED, 1=HALF_OPEN, 2=OPEN |
+| `llm_cache_hits_total` | Counter | Requests served from Redis cache |
+| `llm_cache_misses_total` | Counter | Requests requiring fresh LLM generation |
+| `llm_rate_limit_exceeded_total` | Counter | Requests rejected by rate limiter |
+| `http_requests_total` | Counter | HTTP requests by method, endpoint, status code |
+| `http_request_duration_seconds` | Histogram | End-to-end request latency |
+
+---
+
+### Additional Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | /auth/register | Register a new user account (USER role by default) |
+| GET | /auth/me | Return the profile of the authenticated user |
+| GET | / | Service metadata and link index |
+| GET | /docs | Swagger UI interactive documentation |
+| GET | /redoc | ReDoc API documentation |
+
+---
+
+## Authentication and RBAC
+
+Authentication uses HS256-signed JWT tokens. Each token carries a `sub` (user ID), `role`, `username`, `exp`, `iat`, and `nbf` claim.
+
+Role permissions:
+
+| Endpoint | Admin | User | Read-Only |
+|---|---|---|---|
+| POST /auth/login, /auth/register | Yes | Yes (self) | No |
+| GET /auth/me | Yes | Yes | Yes |
+| POST /chat | Yes | Yes (rate-limited) | No (403) |
+| GET /health | Yes | Yes | Yes |
+| GET /metrics | Yes | No (403) | No (403) |
+
+The `/auth/register` endpoint intentionally prevents self-assignment of the Admin role. Admin accounts must be created by seeding or by an existing administrator.
+
+For SSO/OIDC extension details (Okta, Keycloak, Azure Entra ID, PKCE flows, JWKS key rotation, API Gateway token offloading), see Section 1 of ARCHITECTURE.md.
+
+---
+
+## LLM Gateway Resilience
+
+The `ResilientLLMGateway` class (`app/services/llm_gateway.py`) orchestrates:
+
+1. Circuit Breaker: 3-state machine (CLOSED / HALF_OPEN / OPEN) per provider. Trips after 5 consecutive failures; enters HALF_OPEN after a 30-second recovery timeout; closes after 2 successful probe requests.
+
+2. Exponential Backoff with Jitter: `sleep = min(max_backoff, base * 2^attempt) + uniform_jitter`. Default: base 0.5s, max 4.0s, jitter factor 0.25. Up to 3 retries per provider.
+
+3. Error Classification: Timeout (504), rate limit (429), and 5xx errors are retryable. 4xx client errors (bad prompt, invalid key) fail fast without retry.
+
+4. Model Fallback: When the primary model's circuit is OPEN or retries are exhausted, requests are routed to the fallback model on the same provider. If both fail, a 503 is returned.
+
+5. Redis Cache-Aside: Responses are cached by SHA-256 hash of `(question, model)`. Cache TTL defaults to 3600 seconds. Cache reads bypass the LLM entirely and log a zero-cost usage record.
+
+Supported providers:
+
+| Provider | Value | Notes |
+|---|---|---|
+| Mock | `mock` | Default. Deterministic responses, no API key required. Supports fault injection for testing. |
+| OpenAI | `openai` | Requires `OPENAI_API_KEY`. Models: gpt-4o-mini (primary), gpt-3.5-turbo (fallback). |
+| Gemini | `gemini` | Requires `GEMINI_API_KEY`. Models: gemini-1.5-flash. |
+
+---
+
+## Prerequisites
+
+- Python 3.10 or higher
+- Docker and Docker Compose (for containerized deployment)
+- Redis 7 (for local development without Docker)
+- PostgreSQL 16 (for local development without Docker; SQLite is used by default)
+
+---
+
+## Configuration
+
+Copy `.env.example` to `.env` and set the required values:
+
 ```bash
-curl -X GET http://localhost:8000/metrics
+cp .env.example .env
 ```
-**Sample Output:**
+
+Key variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_PROVIDER` | `mock` | Active provider: `mock`, `openai`, or `gemini` |
+| `OPENAI_API_KEY` | _(empty)_ | Required when `LLM_PROVIDER=openai` |
+| `GEMINI_API_KEY` | _(empty)_ | Required when `LLM_PROVIDER=gemini` |
+| `JWT_SECRET_KEY` | _(dev value)_ | Must be replaced with a 32+ character secret in production |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./chat_platform.db` | PostgreSQL URL for Docker: `postgresql+asyncpg://user:pass@db:5432/chat_platform` |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection string |
+| `RATE_LIMIT_REQUESTS_PER_MINUTE` | `60` | Sliding-window quota per user/IP |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive failures before circuit opens |
+| `MAX_RETRIES` | `3` | Maximum retry attempts per provider |
+
+Generate a secure JWT secret key:
+```bash
+openssl rand -hex 32
+```
+
+---
+
+## Running Locally
+
+Install dependencies:
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Start the server (SQLite + mock LLM, no external dependencies):
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The API will be available at http://localhost:8000. Interactive docs are at http://localhost:8000/docs.
+
+Default seed accounts are created on first startup. See Default Credentials.
+
+---
+
+## Running with Docker Compose
+
+The compose stack includes the FastAPI application, PostgreSQL 16, Redis 7, and Prometheus.
+
+Start all services:
+```bash
+docker compose up --build
+```
+
+Start in detached mode:
+```bash
+docker compose up --build -d
+```
+
+Service ports:
+
+| Service | Port | Description |
+|---|---|---|
+| FastAPI API | 8000 | Main application |
+| PostgreSQL | 5432 | Database |
+| Redis | 6379 | Cache and rate limiter |
+| Prometheus | 9090 | Metrics scraper |
+
+To use a real LLM provider with Docker Compose, set the relevant variables in your `.env` file before running:
+
+```bash
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+```
+
+Stop and remove containers:
+```bash
+docker compose down
+```
+
+Stop and remove containers along with volumes (clears all data):
+```bash
+docker compose down -v
+```
+
+---
+
+## Kubernetes Deployment
+
+Manifests are located in the `k8s/` directory.
+
+Files:
+
+| File | Description |
+|---|---|
+| `k8s/deployment.yaml` | FastAPI deployment: 3 replicas, rolling update, liveness/readiness/startup probes |
+| `k8s/service.yaml` | ClusterIP service exposing port 8000 |
+| `k8s/hpa.yaml` | HorizontalPodAutoscaler: 3-30 replicas, CPU target 60%, memory target 75% |
+| `k8s/configmap.yaml` | Non-sensitive environment configuration |
+| `k8s/secret.yaml` | Template for sensitive values (JWT secret, API keys, database credentials) |
+
+Apply manifests:
+```bash
+kubectl apply -f k8s/secret.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+kubectl apply -f k8s/hpa.yaml
+```
+
+Before applying, update `k8s/secret.yaml` with base64-encoded production values. Never commit actual secrets to version control.
+
+HPA behavior:
+- Scale-up: up to 100% pod expansion every 15 seconds (aggressively tracks traffic spikes)
+- Scale-down: maximum 10% reduction per 60 seconds with a 300-second stabilization window (prevents thrashing)
+
+---
+
+## Running Tests
+
+Tests use `fakeredis` and `aiosqlite` (in-memory SQLite). No external services are required.
+
+Run the full test suite:
+```bash
+pytest tests/ -v
+```
+
+Run a specific test phase:
+```bash
+pytest tests/test_phase1_database.py -v
+pytest tests/test_phase2_auth.py -v
+pytest tests/test_phase3_llm_gateway.py -v
+pytest tests/test_phase4_redis.py -v
+pytest tests/test_phase5_chat_api.py -v
+```
+
+Test coverage by phase:
+
+| Phase | File | Coverage |
+|---|---|---|
+| 1 | `test_phase1_database.py` | Database initialization, schema creation, user seeding |
+| 2 | `test_phase2_auth.py` | Login, token validation, RBAC enforcement, inactive accounts |
+| 3 | `test_phase3_llm_gateway.py` | Circuit breaker state transitions, retry logic, fault injection |
+| 4 | `test_phase4_redis.py` | Sliding-window rate limiter, cache set/get/TTL |
+| 5 | `test_phase5_chat_api.py` | End-to-end chat flow, cache hits, rate limiting, error responses |
+
+---
+
+## Monitoring
+
+When running via Docker Compose, Prometheus scrapes the `/metrics` endpoint every 5 seconds.
+
+Access Prometheus at http://localhost:9090.
+
+Useful queries:
+
 ```promql
-# HELP llm_tokens_total Total prompt and completion tokens consumed
-# TYPE llm_tokens_total counter
-llm_tokens_total{model="gpt-4o-mini",token_type="prompt"} 11.0
-llm_tokens_total{model="gpt-4o-mini",token_type="completion"} 32.0
+# LLM request rate by model
+rate(llm_gateway_requests_total[1m])
 
-# HELP llm_circuit_breaker_state Current circuit breaker state: 0=CLOSED, 1=HALF_OPEN, 2=OPEN
-# TYPE llm_circuit_breaker_state gauge
-llm_circuit_breaker_state{provider="primary_llm"} 0.0
+# p95 LLM response latency
+histogram_quantile(0.95, rate(llm_request_duration_seconds_bucket[5m]))
 
-# HELP llm_cache_hits_total Total queries served from Redis cache without LLM invocation
-# TYPE llm_cache_hits_total counter
-llm_cache_hits_total 1.0
+# Cache hit ratio
+rate(llm_cache_hits_total[5m]) / (rate(llm_cache_hits_total[5m]) + rate(llm_cache_misses_total[5m]))
+
+# Circuit breaker state (2 = OPEN)
+llm_circuit_breaker_state
+
+# Total tokens consumed
+increase(llm_tokens_total[1h])
+```
+
+For production deployments, connect Grafana to Prometheus and configure alerting rules on circuit breaker state changes, p99 latency exceeding thresholds, and error rate spikes.
+
+---
+
+## Default Credentials
+
+These accounts are seeded automatically on first startup.
+
+| Username | Password | Role | Permissions |
+|---|---|---|---|
+| `admin` | `admin123` | Admin | All endpoints including /metrics, user management |
+| `user` | `user123` | User | POST /chat (rate-limited), /health, /auth/me |
+| `readonly` | `readonly123` | Read-Only | GET /health, GET /auth/me only |
+
+Change these credentials immediately in any environment accessible beyond localhost.
+
+---
+
+## Project Structure
+
+```
+.
+|-- app/
+|   |-- main.py                     # Application entry point, middleware, router registration
+|   |-- config.py                   # Pydantic Settings: all configuration via environment variables
+|   |-- api/
+|   |   |-- deps.py                 # Shared dependencies: auth, RBAC guards, rate limiter guard
+|   |   `-- v1/
+|   |       |-- auth.py             # POST /auth/login, POST /auth/register, GET /auth/me
+|   |       |-- chat.py             # POST /chat
+|   |       |-- health.py           # GET /health
+|   |       `-- metrics.py          # GET /metrics
+|   |-- core/
+|   |   |-- database.py             # SQLAlchemy async engine, session factory, schema init, seeding
+|   |   |-- redis.py                # Redis async client with connection pooling and health probe
+|   |   `-- security.py             # bcrypt password hashing, JWT issuance and decoding
+|   |-- models/
+|   |   |-- user.py                 # User ORM model, UserRole enum
+|   |   `-- usage.py                # LLMUsageLog ORM model, RequestStatus enum
+|   |-- schemas/
+|   |   |-- auth.py                 # Pydantic request/response schemas for auth endpoints
+|   |   `-- chat.py                 # ChatRequest, ChatResponse, UsageStats schemas
+|   `-- services/
+|       |-- llm_gateway.py          # ResilientLLMGateway, CircuitBreaker, provider implementations
+|       |-- cache_service.py        # Redis cache-aside read/write with key hashing
+|       |-- rate_limiter.py         # DistributedRateLimiter using Redis sorted sets
+|       `-- metrics_service.py      # Prometheus counter/histogram/gauge instrumentation
+|-- tests/
+|   |-- conftest.py                 # Global test fixtures, environment patching
+|   |-- test_phase1_database.py
+|   |-- test_phase2_auth.py
+|   |-- test_phase3_llm_gateway.py
+|   |-- test_phase4_redis.py
+|   `-- test_phase5_chat_api.py
+|-- k8s/
+|   |-- deployment.yaml
+|   |-- service.yaml
+|   |-- hpa.yaml
+|   |-- configmap.yaml
+|   `-- secret.yaml
+|-- scripts/
+|   `-- init_db.py                  # Standalone database initialization utility
+|-- Dockerfile                      # Multi-stage build: builder + slim runtime, non-root user
+|-- docker-compose.yml              # FastAPI + PostgreSQL + Redis + Prometheus
+|-- prometheus.yml                  # Prometheus scrape configuration
+|-- requirements.txt                # Pinned Python dependencies
+|-- .env.example                    # Environment variable template
+|-- ARCHITECTURE.md                 # SSO/OIDC design, scaling analysis, migration plan
+`-- README.md
 ```
 
 ---
 
-## 🧪 Automated Testing Suite
+## Scaling and Architecture Decisions
 
-The repository contains 23 comprehensive tests verifying resilience, rate limits, caching, and auth:
+The platform is designed for horizontal scaling. Key decisions:
 
-```bash
-# Run the entire pytest suite
-pytest -v
-```
+Stateless API Instances: All shared state (rate limit counters, response cache) lives in Redis. Any number of FastAPI pods can run behind a load balancer without sticky sessions.
 
-### Test Suite Coverage:
-- `tests/test_phase1_database.py`: User entity, bcrypt verification, `LLMUsageLog` persistence.
-- `tests/test_phase2_auth.py`: JWT login, bad passwords, expired tokens, RBAC permission checks.
-- `tests/test_phase3_llm_gateway.py`: Happy path, transient retry backoff, fallback invocation on primary failure, non-retryable 4xx rejection, and 3-state Circuit Breaker transitions (`CLOSED` $\rightarrow$ `OPEN` $\rightarrow$ `HALF_OPEN` $\rightarrow$ `CLOSED`).
-- `tests/test_phase4_redis.py`: Cache miss, cache hit, whitespace/casing query normalization, and sliding-window rate limit exhaustion.
-- `tests/test_phase5_chat_api.py`: `/chat` end-to-end integration, database audit row verification, cache hit zero-token verification, fallback headers, and deep `/health` probes.
+Async Throughout: SQLAlchemy async engine, async Redis client, and httpx async HTTP calls mean a single Uvicorn worker can handle many concurrent in-flight LLM requests without blocking.
 
----
+Fail-Open on Redis Failure: If Redis becomes unavailable, the rate limiter allows requests through and the cache is bypassed. The platform remains operational at the cost of cache efficiency and rate limiting precision.
 
-## 📚 Architectural Deep-Dives
+Circuit Breaker Prevents Cascading Failures: When an upstream LLM provider becomes slow or returns errors, the circuit opens and requests fail-fast (503) rather than accumulating in-flight connections and exhausting the worker pool.
 
-- **[ARCHITECTURE.md](file:///d:/chat-assignment/ARCHITECTURE.md):**
-  - Section 2: Enterprise SSO / OIDC federated identity architecture and RBAC matrix.
-  - Section 4: 100 $\rightarrow$ 500 RPS scaling calculation, Little's Law concurrency analysis, HPA policies, and LLM API limit mitigations.
-  - Section 5: Single EC2 $\rightarrow$ Multi-AZ Kubernetes/ECS zero-downtime migration strategy, database replication, and secrets management.
-- **[LOOM_SCRIPT.md](file:///d:/chat-assignment/LOOM_SCRIPT.md):**
-  - Complete 5-minute video recording walkthrough script highlighting the high-leverage code sections.
+Fallback Model as Degraded-Mode Operation: A second model is configured as fallback. If the primary model's circuit opens, the fallback model's circuit is attempted before returning a 503 to the client.
+
+For a detailed analysis of the 100-500 RPS scaling scenario, Little's Law capacity calculations, HPA configuration rationale, Redis cluster topology, and the EC2-to-EKS zero-downtime migration playbook, refer to ARCHITECTURE.md.

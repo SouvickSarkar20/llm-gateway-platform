@@ -63,6 +63,9 @@ coverage.xml
 *.swo
 *~
 
+# Personal Recording Scripts
+LOOM_SCRIPT.md
+
 # Logs
 *.log
 logs/
