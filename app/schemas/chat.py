@@ -41,6 +41,10 @@ class ChatRequest(BaseModel):
         True,
         description="Whether to check and store results in the Redis cache-aside layer",
     )
+    async_mode: bool = Field(
+        False,
+        description="Explicitly offload request processing to async priority queue returning HTTP 202",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -92,4 +96,17 @@ class ChatResponse(BaseModel):
                 "request_id": "c1f7b0f6-d189-4e78-a28a-78a02c918a91",
             }
         }
+    }
+
+
+class AsyncJobResponse(BaseModel):
+    """HTTP 202 Accepted response for queued asynchronous LLM requests."""
+    job_id: str = Field(..., description="Unique tracking ID for the queued job")
+    status: str = Field("queued", description="Initial status of the job (queued)")
+    message: str = Field(..., description="Informational message regarding queueing and backpressure")
+    poll_url: str = Field(..., description="Endpoint URL to poll job status and result")
+    stream_url: str = Field(..., description="Server-Sent Events (SSE) streaming URL for live progress updates")
+
+    model_config = {
+        "protected_namespaces": (),
     }

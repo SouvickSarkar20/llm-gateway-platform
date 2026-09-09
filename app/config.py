@@ -72,6 +72,18 @@ class Settings(BaseSettings):
     PROMETHEUS_METRICS_PATH: str = "/metrics"
     ENABLE_STRUCTURED_LOGGING: bool = True
 
+    # SQS & Queue Backpressure Configuration
+    SQS_ENABLED: bool = False
+    AWS_REGION: str = "us-east-1"
+    AWS_ACCESS_KEY_ID: Optional[str] = None
+    AWS_SECRET_ACCESS_KEY: Optional[str] = None
+    AWS_ENDPOINT_URL: Optional[str] = None
+    SQS_HIGH_PRIORITY_URL: str = "http://localhost:4566/000000000000/llm-requests-high-priority.fifo"
+    SQS_STANDARD_URL: str = "http://localhost:4566/000000000000/llm-requests-standard.fifo"
+    SQS_BATCH_URL: str = "http://localhost:4566/000000000000/llm-requests-batch.fifo"
+    JOB_TTL_SECONDS: int = 86400
+    ASYNC_BACKPRESSURE_THRESHOLD_REMAINING: float = 2.0  # Enqueue if remaining rate tokens <= 2.0
+
     # Pricing per 1k tokens in USD for cost tracking
     # [prompt_cost_per_1k, completion_cost_per_1k]
     MODEL_PRICING: Dict[str, Dict[str, float]] = Field(

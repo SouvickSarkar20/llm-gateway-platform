@@ -3,16 +3,19 @@
 import logging
 import time
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.database import get_db
 from app.models.user import User
 from app.models.usage import LLMUsageLog, RequestStatus
-from app.schemas.chat import ChatRequest, ChatResponse, UsageStats
+from app.schemas.chat import ChatRequest, ChatResponse, UsageStats, AsyncJobResponse
 from app.api.deps import require_user_or_admin, get_rate_limiter_guard
 from app.services.cache_service import cache_service
 from app.services.rate_limiter import RateLimitResult
+from app.services.job_service import job_service
+from app.services.sqs_producer import sqs_producer
 from app.services.llm_gateway import (
     gateway,
     LLMRequest,
@@ -42,7 +45,7 @@ async def chat(
     response: Response,
     current_user: User = Depends(require_user_or_admin),
     db: AsyncSession = Depends(get_db),
-) -> ChatResponse:
+):
     """Execute AI Question-Answering with caching, resilience, and token/cost auditing."""
     request_id = getattr(request.state, "request_id", "req-unknown")
     start_time = time.perf_counter()
@@ -73,6 +76,52 @@ async def chat(
         response.headers["X-RateLimit-Limit"] = str(rate_limit_result.limit)
         response.headers["X-RateLimit-Remaining"] = str(rate_limit_result.remaining)
         response.headers["X-RateLimit-Reset"] = str(rate_limit_result.reset_in_seconds)
+
+    # Check if request should be offloaded to async queue due to rate limit saturation or explicit async mode
+    is_async = payload.async_mode or (request.headers.get("X-Async-Request", "").lower() == "true")
+    remaining_tokens = rate_limit_result.remaining if rate_limit_result else float("inf")
+    if is_async or (remaining_tokens <= settings.ASYNC_BACKPRESSURE_THRESHOLD_REMAINING):
+        logger.info(
+            "Offloading request %s to SQS priority queue (async=%s, remaining_tokens=%.1f)",
+            request_id,
+            is_async,
+            remaining_tokens,
+        )
+        tenant_id = getattr(current_user, "tenant_id", "default")
+        tier = getattr(current_user, "tier", "default")
+        job_data = await job_service.create_job(
+            tenant_id=tenant_id,
+            tier=tier,
+            question=question_text,
+            model=target_model,
+            messages=messages,
+            use_cache=payload.use_cache,
+            temperature=payload.temperature or 0.7,
+            max_tokens=payload.max_tokens or 1024,
+        )
+        await sqs_producer.enqueue_job(job_data)
+
+        job_id = job_data["job_id"]
+        poll_url = f"{settings.API_V1_PREFIX}/jobs/{job_id}"
+        stream_url = f"{settings.API_V1_PREFIX}/jobs/{job_id}/stream"
+
+        async_response = AsyncJobResponse(
+            job_id=job_id,
+            status="queued",
+            message="LLM capacity saturated or async mode requested. Job placed on priority queue.",
+            poll_url=poll_url,
+            stream_url=stream_url,
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=async_response.model_dump(),
+            headers={
+                "Location": poll_url,
+                "Retry-After": "2",
+                "X-Job-ID": job_id,
+            },
+        )
 
     # 2. Redis Cache-Aside Check
     if payload.use_cache:

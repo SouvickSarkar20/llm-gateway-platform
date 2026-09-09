@@ -14,8 +14,10 @@ from app.core.database import init_db, engine
 from app.core.redis import get_redis_client, close_redis
 from app.api.v1.auth import router as auth_router
 from app.api.v1.chat import router as chat_router
+from app.api.v1.jobs import router as jobs_router
 from app.api.v1.health import router as health_router
 from app.api.v1.metrics import router as metrics_router
+from app.workers.sqs_consumer import worker
 
 # Configure structured logging
 logging.basicConfig(
@@ -44,10 +46,17 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Redis initial connection warning: %s", exc)
 
+    # 3. Start SQS Consumer Worker
+    try:
+        await worker.start()
+    except Exception as exc:
+        logger.warning("Worker startup warning: %s", exc)
+
     yield
 
     # Shutdown
     logger.info("Shutting down %s...", settings.APP_NAME)
+    await worker.stop()
     await close_redis()
     await engine.dispose()
     logger.info("Cleanup completed. Goodbye.")
@@ -106,6 +115,9 @@ Instrumentator(
 # Mount routers directly per assessment specification
 app.include_router(auth_router)
 app.include_router(chat_router)
+app.include_router(chat_router, prefix=settings.API_V1_PREFIX)
+app.include_router(jobs_router)
+app.include_router(jobs_router, prefix=settings.API_V1_PREFIX)
 app.include_router(health_router)
 app.include_router(metrics_router)
 
