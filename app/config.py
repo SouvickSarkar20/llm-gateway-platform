@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     # Rate Limiting Configuration
     RATE_LIMIT_REQUESTS_PER_MINUTE: int = 60
     RATE_LIMIT_BURST: int = 10
+    TENANT_TIERS: Dict[str, Dict[str, float]] = Field(
+        default_factory=lambda: {
+            "free": {"capacity": 10.0, "refill_rate": 0.1667, "rpm": 10},
+            "pro": {"capacity": 30.0, "refill_rate": 1.0, "rpm": 60},
+            "enterprise": {"capacity": 100.0, "refill_rate": 5.0, "rpm": 300},
+            "default": {"capacity": 20.0, "refill_rate": 1.0, "rpm": 60},
+        }
+    )
 
     # LLM Gateway Configuration
     LLM_PROVIDER: str = "mock"  # "mock", "openai", "gemini"

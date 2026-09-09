@@ -93,8 +93,9 @@ require_authenticated = get_current_user
 def get_rate_limiter_guard(
     max_requests: Optional[int] = None,
     window_seconds: Optional[int] = None,
+    default_tier: Optional[str] = None,
 ) -> Callable:
-    """FastAPI dependency enforcing distributed rate limiting per user or client IP."""
+    """FastAPI dependency enforcing distributed Token Bucket rate limiting per tenant, API Key, user, or IP."""
     from fastapi import Request
     from app.services.rate_limiter import rate_limiter
 
@@ -103,11 +104,29 @@ def get_rate_limiter_guard(
         credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
     ) -> None:
         identifier = f"ip:{request.client.host if request.client else 'unknown'}"
-        if credentials and credentials.credentials:
+        tenant_tier: Optional[str] = default_tier or request.headers.get("X-Tenant-Tier")
+
+        # 1. Check X-API-Key header
+        api_key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
+        if api_key:
+            identifier = f"tenant:{api_key}"
+            if not tenant_tier:
+                if api_key.startswith("sk-ent"):
+                    tenant_tier = "enterprise"
+                elif api_key.startswith("sk-pro"):
+                    tenant_tier = "pro"
+                elif api_key.startswith("sk-free"):
+                    tenant_tier = "free"
+        elif credentials and credentials.credentials:
             try:
                 payload = decode_access_token(credentials.credentials)
                 if sub := payload.get("sub"):
                     identifier = f"user:{sub}"
+                    if role := payload.get("role"):
+                        if role == "admin":
+                            tenant_tier = tenant_tier or "enterprise"
+                        elif role == "user":
+                            tenant_tier = tenant_tier or "pro"
             except Exception:
                 pass  # Fallback to IP identifier
 
@@ -115,12 +134,13 @@ def get_rate_limiter_guard(
             identifier=identifier,
             max_requests=max_requests,
             window_seconds=window_seconds,
+            tenant_tier=tenant_tier,
         )
 
         if not result.allowed:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=f"Rate limit exceeded: maximum {result.limit} requests per {window_seconds or 60} seconds.",
+                detail=f"Rate limit exceeded: quota depleted for identifier '{identifier}'. Retry in {result.reset_in_seconds}s.",
                 headers={
                     "Retry-After": str(result.reset_in_seconds),
                     "X-RateLimit-Limit": str(result.limit),
