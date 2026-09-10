@@ -1,7 +1,7 @@
 """API dependencies: database session, authentication, and RBAC guards."""
 
 from typing import Callable, List, Optional
-from fastapi import Depends, HTTPException, Security, status
+from fastapi import Depends, HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -153,3 +153,14 @@ def get_rate_limiter_guard(
         request.state.rate_limit_result = result
 
     return rate_limit_dependency
+
+
+def get_idempotency_key(request: Request) -> Optional[str]:
+    """Extract Idempotency-Key or X-Idempotency-Key header from incoming request."""
+    return (
+        request.headers.get("Idempotency-Key")
+        or request.headers.get("idempotency-key")
+        or request.headers.get("X-Idempotency-Key")
+        or request.headers.get("x-idempotency-key")
+    )
+

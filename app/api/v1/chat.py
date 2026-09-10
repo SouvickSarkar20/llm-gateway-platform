@@ -1,4 +1,4 @@
-"""Chat API endpoint: wires authentication, rate limiting, caching, LLM gateway, and DB usage tracking."""
+"""Chat API endpoint: wires authentication, rate limiting, caching, LLM gateway, DB usage tracking, and Idempotency."""
 
 import logging
 import time
@@ -11,11 +11,12 @@ from app.core.database import get_db
 from app.models.user import User
 from app.models.usage import LLMUsageLog, RequestStatus
 from app.schemas.chat import ChatRequest, ChatResponse, UsageStats, AsyncJobResponse
-from app.api.deps import require_user_or_admin, get_rate_limiter_guard
+from app.api.deps import require_user_or_admin, get_rate_limiter_guard, get_idempotency_key
 from app.services.cache_service import cache_service
 from app.services.rate_limiter import RateLimitResult
 from app.services.job_service import job_service
 from app.services.sqs_producer import sqs_producer
+from app.services.idempotency_service import idempotency_service
 from app.services.llm_gateway import (
     gateway,
     LLMRequest,
@@ -46,7 +47,7 @@ async def chat(
     current_user: User = Depends(require_user_or_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Execute AI Question-Answering with caching, resilience, and token/cost auditing."""
+    """Execute AI Question-Answering with caching, resilience, tenant billing, and idempotency."""
     request_id = getattr(request.state, "request_id", "req-unknown")
     start_time = time.perf_counter()
 
@@ -70,6 +71,13 @@ async def chat(
 
     target_model = payload.model or settings.PRIMARY_MODEL
 
+    # Resolve Tenant Identity
+    tenant_id = (
+        request.headers.get("X-Tenant-ID")
+        or request.headers.get("X-API-Key")
+        or getattr(current_user, "tenant_id", current_user.id)
+    )
+
     # Attach rate limit headers if available
     rate_limit_result: RateLimitResult | None = getattr(request.state, "rate_limit_result", None)
     if rate_limit_result:
@@ -77,7 +85,30 @@ async def chat(
         response.headers["X-RateLimit-Remaining"] = str(rate_limit_result.remaining)
         response.headers["X-RateLimit-Reset"] = str(rate_limit_result.reset_in_seconds)
 
-    # Check if request should be offloaded to async queue due to rate limit saturation or explicit async mode
+    # 2. Check Idempotency-Key Header
+    idempotency_key = get_idempotency_key(request)
+    if idempotency_key:
+        status_state, cached_payload = await idempotency_service.get_or_lock(
+            identifier=tenant_id, idempotency_key=idempotency_key
+        )
+        if status_state == "COMPLETED" and cached_payload:
+            logger.info(
+                "Idempotency hit for key '%s': returning cached response",
+                idempotency_key,
+            )
+            response.headers["X-Idempotent-Replay"] = "true"
+            return ChatResponse(**cached_payload)
+        elif status_state == "PROCESSING":
+            logger.warning(
+                "Idempotency lock active for key '%s': returning HTTP 409 Conflict",
+                idempotency_key,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Request with Idempotency-Key '{idempotency_key}' is currently processing.",
+            )
+
+    # 3. Check Async Queue Offload
     is_async = payload.async_mode or (request.headers.get("X-Async-Request", "").lower() == "true")
     remaining_tokens = rate_limit_result.remaining if rate_limit_result else float("inf")
     if is_async or (remaining_tokens <= settings.ASYNC_BACKPRESSURE_THRESHOLD_REMAINING):
@@ -87,7 +118,6 @@ async def chat(
             is_async,
             remaining_tokens,
         )
-        tenant_id = getattr(current_user, "tenant_id", "default")
         tier = getattr(current_user, "tier", "default")
         job_data = await job_service.create_job(
             tenant_id=tenant_id,
@@ -123,7 +153,7 @@ async def chat(
             },
         )
 
-    # 2. Redis Cache-Aside Check
+    # 4. Redis Cache-Aside Check
     if payload.use_cache:
         cached_result = await cache_service.get(question_text, target_model)
         if cached_result:
@@ -136,6 +166,7 @@ async def chat(
             usage_log = LLMUsageLog(
                 request_id=request_id,
                 user_id=current_user.id,
+                tenant_id=tenant_id,
                 model=cached_result["model_used"],
                 provider=cached_result["provider"],
                 prompt_tokens=0,
@@ -150,7 +181,7 @@ async def chat(
             db.add(usage_log)
             await db.commit()
 
-            return ChatResponse(
+            chat_resp = ChatResponse(
                 answer=cached_result["content"],
                 model_used=cached_result["model_used"],
                 provider=cached_result["provider"],
@@ -166,11 +197,20 @@ async def chat(
                 request_id=request_id,
             )
 
+            if idempotency_key:
+                await idempotency_service.save_completed(
+                    identifier=tenant_id,
+                    idempotency_key=idempotency_key,
+                    response_data=chat_resp.model_dump(),
+                )
+
+            return chat_resp
+
     # Cache miss
     metrics_service.record_cache_miss()
     response.headers["X-Cache"] = "MISS"
 
-    # 3. Call Resilient LLM Gateway
+    # 5. Call Resilient LLM Gateway
     llm_request = LLMRequest(
         messages=messages,
         model=target_model,
@@ -181,6 +221,8 @@ async def chat(
     try:
         gateway_response = await gateway.generate(llm_request)
     except CircuitBreakerOpenException as exc:
+        if idempotency_key:
+            await idempotency_service.release_lock(tenant_id, idempotency_key)
         logger.warning("Circuit breaker fast-fail for request %s: %s", request_id, exc)
         response.headers["Retry-After"] = str(int(exc.recovery_time_remaining))
         raise HTTPException(
@@ -188,11 +230,11 @@ async def chat(
             detail=str(exc),
             headers={"Retry-After": str(int(exc.recovery_time_remaining))},
         )
-    except LLMClientException as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message)
-    except LLMGatewayException as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message)
-    except Exception as exc:
+    except (LLMClientException, LLMGatewayException, Exception) as exc:
+        if idempotency_key:
+            await idempotency_service.release_lock(tenant_id, idempotency_key)
+        if isinstance(exc, (LLMClientException, LLMGatewayException)):
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
         logger.exception("Unexpected error in LLM gateway execution: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -206,13 +248,14 @@ async def chat(
         gateway_response.completion_tokens,
     )
 
-    # 4. Asynchronously Persist Usage & Cost in PostgreSQL
+    # 6. Asynchronously Persist Usage & Cost in PostgreSQL with Tenant ID
     usage_status = (
         RequestStatus.FALLBACK if gateway_response.is_fallback else RequestStatus.SUCCESS
     )
     usage_log = LLMUsageLog(
         request_id=request_id,
         user_id=current_user.id,
+        tenant_id=tenant_id,
         model=gateway_response.model_used,
         provider=gateway_response.provider,
         prompt_tokens=gateway_response.prompt_tokens,
@@ -227,11 +270,11 @@ async def chat(
     db.add(usage_log)
     await db.commit()
 
-    # 5. Populate Redis Cache
+    # 7. Populate Redis Cache
     if payload.use_cache:
         await cache_service.set(question_text, target_model, gateway_response)
 
-    # 6. Record Prometheus Metrics
+    # 8. Record Prometheus Metrics
     metrics_service.record_llm_execution(
         model=gateway_response.model_used,
         provider=gateway_response.provider,
@@ -246,7 +289,7 @@ async def chat(
     if gateway_response.is_fallback:
         response.headers["X-Fallback-Triggered"] = "true"
 
-    return ChatResponse(
+    chat_resp = ChatResponse(
         answer=gateway_response.content,
         model_used=gateway_response.model_used,
         provider=gateway_response.provider,
@@ -261,3 +304,12 @@ async def chat(
         ),
         request_id=request_id,
     )
+
+    if idempotency_key:
+        await idempotency_service.save_completed(
+            identifier=tenant_id,
+            idempotency_key=idempotency_key,
+            response_data=chat_resp.model_dump(),
+        )
+
+    return chat_resp

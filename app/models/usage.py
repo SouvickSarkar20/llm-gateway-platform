@@ -31,6 +31,9 @@ class LLMUsageLog(Base):
     user_id: Mapped[str] = mapped_column(
         String(36), index=True, nullable=False
     )
+    tenant_id: Mapped[Optional[str]] = mapped_column(
+        String(36), index=True, nullable=True
+    )
     model: Mapped[str] = mapped_column(
         String(64), index=True, nullable=False
     )
